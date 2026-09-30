@@ -1,8 +1,33 @@
-import { chromium, type Browser } from 'playwright';
+import { chromium, type Browser, type Page } from 'playwright';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { CaptureOptions, Screenshot, Viewport } from './types.js';
+
+/**
+ * Scrolls to the bottom of the page in steps and back to the top, giving
+ * scroll-triggered/lazy-loaded content (common in responsive layouts) a
+ * chance to load before a full-page screenshot is taken.
+ */
+async function autoScroll(page: Page): Promise<void> {
+  await page.evaluate(async () => {
+    await new Promise<void>((resolve) => {
+      const distance = 400;
+      let total = 0;
+      const timer = setInterval(() => {
+        const scrollHeight = document.body.scrollHeight;
+        window.scrollBy(0, distance);
+        total += distance;
+        if (total >= scrollHeight) {
+          clearInterval(timer);
+          resolve();
+        }
+      }, 100);
+    });
+  });
+  await page.evaluate(() => window.scrollTo(0, 0));
+  await page.waitForTimeout(200);
+}
 
 export class BrowserCapture {
   private browser: Browser | null = null;
@@ -30,6 +55,9 @@ export class BrowserCapture {
       hasTouch: viewport.hasTouch,
       userAgent: viewport.userAgent,
       storageState: options.storageStatePath,
+      // Freezes CSS animations/transitions (menu toggles, carousels, etc.) so
+      // responsive components that animate between states don't cause flaky diffs.
+      reducedMotion: 'reduce',
     });
 
     try {
@@ -54,6 +82,17 @@ export class BrowserCapture {
         await page.waitForTimeout(options.waitForTimeout);
       }
 
+      // Many responsive layouts lazy-load images/sections as they scroll into
+      // view (IntersectionObserver, srcset swaps). Walk the page once so a
+      // full-page capture reflects the fully-loaded state, not just the fold.
+      if (options.fullPage) {
+        await autoScroll(page);
+      }
+
+      // Wait for web fonts so text reflow (line breaks, wrapping) has settled
+      // before the screenshot — responsive text wrapping is sensitive to this.
+      await page.evaluate(() => document.fonts?.ready).catch(() => undefined);
+
       if (options.hideSelectors?.length) {
         await page.evaluate((selectors) => {
           for (const sel of selectors) {
@@ -72,6 +111,9 @@ export class BrowserCapture {
         path: outputPath,
         fullPage: options.fullPage ?? false,
         mask,
+        // Belt-and-suspenders alongside context-level reducedMotion: forces
+        // CSS animations/transitions/infinite animations to their end state.
+        animations: 'disabled',
       });
 
       return {
